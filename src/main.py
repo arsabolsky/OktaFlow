@@ -54,7 +54,7 @@ class BearerToken:
     claims: BearerTokenClaims
 
     @classmethod
-    def from_base64(cls, b64_token: str) -> "BearerToken":
+    def from_base64(cls, b64_token: str, mission_id: Optional[str] = None) -> "BearerToken":
         """Decodes the JWT to extract claims without verifying the signature."""
         try:
             _, payload_b64, _ = b64_token.split(".")
@@ -62,11 +62,15 @@ class BearerToken:
             payload_json = base64.b64decode(payload_b64).decode("utf-8")
             claims_data = json.loads(payload_json)
 
-            mission_id = claims_data.get("mission_id") or claims_data.get(
-                "mvo", {}
-            ).get("mid")
             if not mission_id:
-                raise ValueError("Could not find mission_id in token claims")
+                mission_id = (
+                    claims_data.get("missionId")
+                    or claims_data.get("mission_id")
+                    or claims_data.get("mvo", {}).get("mid")
+                )
+
+            if not mission_id:
+                raise ValueError("Could not find mission_id in token claims or response body")
 
             claims = BearerTokenClaims(mission_id=str(mission_id))
             return cls(token=b64_token, claims=claims)
@@ -83,14 +87,9 @@ class ChurchClient:
     def __init__(self, env: Env):
         self.env = env
         self.working_path = Path(env.working_path)
-        self.bearer_path = self.working_path / "bearer.token"
-        self.cookies_path = self.working_path / "cookies.json"
-
         self.bearer_token: Optional[BearerToken] = None
         self._cookie_jar = httpx.Cookies()
-
         self.http_client: Optional[httpx.AsyncClient] = None
-        self.no_redirect_client: Optional[httpx.AsyncClient] = None
 
     @classmethod
     async def create(cls, env: Env) -> "ChurchClient":
@@ -114,8 +113,6 @@ class ChurchClient:
 
     async def _init_clients(self):
         """Initializes the httpx clients in an async context."""
-        self._load_cookies()
-
         self.http_client = httpx.AsyncClient(
             headers={"User-Agent": USER_AGENT},
             cookies=self._cookie_jar,
@@ -127,60 +124,10 @@ class ChurchClient:
             },
         )
 
-        self.no_redirect_client = httpx.AsyncClient(
-            headers={"User-Agent": USER_AGENT},
-            cookies=self._cookie_jar,
-            timeout=60.0,
-            follow_redirects=False,  # Does not follow redirects
-            event_hooks={
-                "request": [self._log_request],
-                "response": [self._log_response],
-            },
-        )
-
-        self._load_bearer_token()
-
-    def _load_bearer_token(self):
-        if self.bearer_path.exists():
-            try:
-                b64_token = self.bearer_path.read_text().strip()
-                if b64_token:
-                    self.bearer_token = BearerToken.from_base64(b64_token)
-                    log.info("Loaded cached bearer token")
-            except Exception as e:
-                log.warning(f"Failed to load cached bearer token, will re-login: {e}")
-                self.bearer_token = None
-
-    def _write_bearer_token(self, token: str):
-        log.info("Saving bearer token")
-        try:
-            self.bearer_path.write_text(token)
-        except IOError as e:
-            log.error(f"Failed to write bearer token: {e}")
-
-    def _load_cookies(self):
-        if self.cookies_path.exists():
-            try:
-                with open(self.cookies_path, "r") as f:
-                    cookies_data = json.load(f)
-                    for name, value in cookies_data.items():
-                        self._cookie_jar.set(name, value)
-                log.info("Loaded cookies from file")
-            except (IOError, json.JSONDecodeError) as e:
-                log.warning(f"Could not load cookies: {e}")
-
-    def _save_cookies(self):
-        log.info("Saving cookies")
-        try:
-            cookies_data = {name: value for name, value in self._cookie_jar.items()}
-            with open(self.cookies_path, "w") as f:
-                json.dump(cookies_data, f)
-        except IOError as e:
-            log.error(f"Failed to save cookies: {e}")
-
     async def login(self) -> BearerToken:
         log.info("Logging into referral manager")
-        self._cookie_jar.clear()
+        if self.http_client:
+            self.http_client.cookies.clear()
 
         # --- PKCE Generation ---
         def generate_random_string(length: int) -> str:
@@ -200,8 +147,9 @@ class ChurchClient:
 
         # Step 1: Visit referral manager to get redirect
         log.info("Visiting referralmanager.churchofjesuschrist.org to capture redirect")
-        redirect_res = await self.no_redirect_client.get(
-            "https://referralmanager.churchofjesuschrist.org/"
+        # Use http_client but don't follow redirects to capture the Location header
+        redirect_res = await self.http_client.get(
+            "https://referralmanager.churchofjesuschrist.org/", follow_redirects=False
         )
         location_url = redirect_res.headers.get("location")
         if not location_url:
@@ -291,8 +239,11 @@ class ChurchClient:
 
         # Step 9: /authorize with okta=true
         log.info("Calling /authorize using location URL with okta=true")
-        authorize_url = httpx.URL(location_url).copy_add_param("okta", "true")
-        await self.http_client.get(authorize_url)
+        if location_url:
+            authorize_url = httpx.URL(location_url).copy_add_param("okta", "true")
+            await self.http_client.get(authorize_url)
+        else:
+            log.warning("Location URL was empty, skipping /authorize call")
 
         # Step 10: Get the bearer token
         log.info("Getting the bearer token")
@@ -301,15 +252,14 @@ class ChurchClient:
             headers={"Accept": "application/json"},
         )
         token_res.raise_for_status()
-        token_str = token_res.json().get("token")
+        token_data = token_res.json()
+        token_str = token_data.get("token")
+        mission_id = token_data.get("missionId")
+
         if not token_str:
             raise Exception(f"Failed to get final token. Response: {token_res.text}")
 
-        # Save state and return
-        self._save_cookies()
-        self._write_bearer_token(token_str)
-
-        token = BearerToken.from_base64(token_str)
+        token = BearerToken.from_base64(token_str, mission_id=mission_id)
         self.bearer_token = token
 
         return token
@@ -320,6 +270,7 @@ class ChurchClient:
             if not self.bearer_token:
                 await self.login()
             try:
+                # print(self.bearer_token)
                 url = (
                     f"https://referralmanager.churchofjesuschrist.org/services/people/mission/"
                     f"{self.bearer_token.claims.mission_id}?includeDroppedPersons=true"
@@ -340,28 +291,6 @@ class ChurchClient:
                 log.warning(f"Getting people list failed (try {i + 1}): {e}")
                 self.bearer_token = None  # Force re-login
         raise Exception("Max retries exceeded for get_people_list")
-
-    async def get_cached_people_list(self) -> List[Dict[str, Any]]:
-        lists_path = self.working_path / "people_lists"
-        lists_path.mkdir(exist_ok=True)
-
-        now = time.time()
-        cache_ttl_secs = 3600  # 1 hour
-
-        for f in lists_path.glob("*.json"):
-            try:
-                timestamp = float(f.stem)
-                if now - timestamp < cache_ttl_secs:
-                    log.info(f"Cache hit: using {f.name}")
-                    data = json.loads(f.read_text())
-                    return data.get("persons", [])
-            except ValueError, IndexError, json.JSONDecodeError:
-                continue
-
-        log.info("Cache miss")
-        people_list = await self.get_people_list()
-        (lists_path / f"{now}.json").write_text(json.dumps({"persons": people_list}))
-        return people_list
 
     # Additional methods like get_person_timeline can be added here following the same pattern.
 
@@ -385,8 +314,9 @@ async def main():
     try:
         client = await ChurchClient.create(env)
 
-        log.info("Fetching cached people list...")
-        people = await client.get_cached_people_list()
+        log.info("Fetching people list...")
+        # Direct call to get_people_list, no caching
+        people = await client.get_people_list()
 
         log.info(f"Successfully fetched {len(people)} people.")
         if people:
