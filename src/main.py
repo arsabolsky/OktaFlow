@@ -6,7 +6,6 @@ import logging
 import os
 import random
 import string
-import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -54,7 +53,9 @@ class BearerToken:
     claims: BearerTokenClaims
 
     @classmethod
-    def from_base64(cls, b64_token: str, mission_id: Optional[str] = None) -> "BearerToken":
+    def from_base64(
+        cls, b64_token: str, mission_id: Optional[str] = None
+    ) -> "BearerToken":
         """Decodes the JWT to extract claims without verifying the signature."""
         try:
             _, payload_b64, _ = b64_token.split(".")
@@ -70,7 +71,9 @@ class BearerToken:
                 )
 
             if not mission_id:
-                raise ValueError("Could not find mission_id in token claims or response body")
+                raise ValueError(
+                    "Could not find mission_id in token claims or response body"
+                )
 
             claims = BearerTokenClaims(mission_id=str(mission_id))
             return cls(token=b64_token, claims=claims)
